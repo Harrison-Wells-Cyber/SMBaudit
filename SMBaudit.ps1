@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [Parameter()]
     [string]$SearchBase,
@@ -72,8 +72,21 @@ function Get-DiskSharesFromNetView {
         [string]$ComputerName
     )
 
-    $cmdOutput = & cmd.exe /c "net view \\$ComputerName /all" 2>$null
+    try {
+        # Redirect stderr inside cmd itself so access-denied/system errors from net.exe
+        # do not surface as PowerShell native-command errors under strict settings.
+        $cmdOutput = & cmd.exe /d /c "net view \\$ComputerName /all 2>nul"
+    }
+    catch {
+        return @()
+    }
+
     if (-not $cmdOutput) {
+        return @()
+    }
+
+    $joinedOutput = $cmdOutput -join [Environment]::NewLine
+    if ($joinedOutput -match 'System error \d+ has occurred') {
         return @()
     }
 
