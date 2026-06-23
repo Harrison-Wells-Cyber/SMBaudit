@@ -10,10 +10,16 @@ param(
     [int]$PingTimeoutSeconds = 1,
 
     [Parameter()]
-    [int]$ShareProbeTimeoutSeconds = 3,
+    [int]$ShareProbeTimeoutSeconds = 6,
 
     [Parameter()]
-    [int]$ThrottleLimit = 64,
+    [int]$ThrottleLimit = 200,
+
+    [Parameter()]
+    [switch]$IncludeHiddenShares,
+
+    [Parameter()]
+    [switch]$UsePerShareTimeout,
 
     [Parameter()]
     [int]$MaxHosts,
@@ -107,20 +113,25 @@ $workerScript = {
     param(
         [string]$ComputerName,
         [int]$PingTimeoutSeconds,
-        [int]$ShareProbeTimeoutSeconds
+        [int]$ShareProbeTimeoutSeconds,
+        [bool]$IncludeHiddenShares,
+        [bool]$UsePerShareTimeout
     )
 
     function Get-DiskSharesFromNetView {
         [CmdletBinding()]
         param(
             [Parameter(Mandatory)]
-            [string]$ComputerName
+            [string]$ComputerName,
+            [bool]$IncludeHiddenShares
         )
 
         try {
             # net.exe uses the current user's token and requires no RSAT, WMI, WinRM,
-            # admin rights, or remote code execution. /all includes hidden shares.
-            $cmdOutput = & cmd.exe /d /c "net view \\$ComputerName /all 2>nul"
+            # admin rights, or remote code execution. Hidden shares are skipped by
+            # default because probing administrative drive shares is slow and noisy.
+            $netViewArgs = if ($IncludeHiddenShares) { "net view \\$ComputerName /all 2>nul" } else { "net view \\$ComputerName 2>nul" }
+            $cmdOutput = & cmd.exe /d /c $netViewArgs
         }
         catch {
             return @()
@@ -206,23 +217,30 @@ $workerScript = {
     }
 
     $shareResults = New-Object 'System.Collections.Generic.List[psobject]'
-    foreach ($share in (Get-DiskSharesFromNetView -ComputerName $ComputerName)) {
+    foreach ($share in (Get-DiskSharesFromNetView -ComputerName $ComputerName -IncludeHiddenShares $IncludeHiddenShares)) {
         $path = "\\$ComputerName\$($share.Name)"
-        $job = Start-Job -ScriptBlock ${function:Test-ShareRights} -ArgumentList $path
-        $completed = Wait-Job -Job $job -Timeout $ShareProbeTimeoutSeconds
+        if ($UsePerShareTimeout) {
+            # Optional compatibility/safety mode. This is much slower because
+            # Start-Job launches a local PowerShell process for each share.
+            $job = Start-Job -ScriptBlock ${function:Test-ShareRights} -ArgumentList $path
+            $completed = Wait-Job -Job $job -Timeout $ShareProbeTimeoutSeconds
 
-        if ($completed) {
-            $probe = Receive-Job -Job $job
+            if ($completed) {
+                $probe = Receive-Job -Job $job
+            }
+            else {
+                Stop-Job -Job $job -ErrorAction SilentlyContinue
+                $probe = [pscustomobject]@{
+                    CanRead = $false
+                    Rights  = 'ProbeTimedOut'
+                    Error   = 'Share probe timed out.'
+                }
+            }
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
         }
         else {
-            Stop-Job -Job $job -ErrorAction SilentlyContinue
-            $probe = [pscustomobject]@{
-                CanRead = $false
-                Rights  = 'ProbeTimedOut'
-                Error   = 'Share probe timed out.'
-            }
+            $probe = Test-ShareRights -Path $path
         }
-        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
 
         [void]$shareResults.Add([pscustomobject]@{
             Computer = $ComputerName
@@ -250,6 +268,8 @@ function Invoke-ParallelShareAudit {
         [int]$ThrottleLimit = 64,
         [int]$PingTimeoutSeconds = 1,
         [int]$ShareProbeTimeoutSeconds = 3,
+        [bool]$IncludeHiddenShares,
+        [bool]$UsePerShareTimeout,
         [scriptblock]$OnHostComplete
     )
 
@@ -263,7 +283,7 @@ function Invoke-ParallelShareAudit {
         foreach ($computer in $ComputerName) {
             $ps = [System.Management.Automation.PowerShell]::Create()
             $ps.RunspacePool = $pool
-            [void]$ps.AddScript($workerScript).AddArgument($computer).AddArgument($PingTimeoutSeconds).AddArgument($ShareProbeTimeoutSeconds)
+            [void]$ps.AddScript($workerScript).AddArgument($computer).AddArgument($PingTimeoutSeconds).AddArgument($ShareProbeTimeoutSeconds).AddArgument([bool]$IncludeHiddenShares).AddArgument([bool]$UsePerShareTimeout)
             [void]$jobs.Add([pscustomobject]@{
                 Computer = $computer
                 Pipeline = $ps
@@ -315,6 +335,8 @@ Write-Section -Text 'LDAP SMB Share Rights Audit' -Color Green
 Write-Host ("Start Time          : {0}" -f (Get-Date)) -ForegroundColor DarkGray
 Write-Host ("SearchBase          : {0}" -f ($(if ($SearchBase) { $SearchBase } else { 'DefaultNamingContext' }))) -ForegroundColor DarkGray
 Write-Host ("ThrottleLimit       : {0}" -f $ThrottleLimit) -ForegroundColor DarkGray
+Write-Host ("Include Hidden      : {0}" -f [bool]$IncludeHiddenShares) -ForegroundColor DarkGray
+Write-Host ("Per-Share Timeout   : {0}" -f [bool]$UsePerShareTimeout) -ForegroundColor DarkGray
 Write-Host ("Share Probe Timeout : {0}s" -f $ShareProbeTimeoutSeconds) -ForegroundColor DarkGray
 Write-Host ("Full Results        : {0}" -f $outputPaths.FullResultsPath) -ForegroundColor DarkGray
 Write-Host ("Readable Shares     : {0}" -f $outputPaths.ReadableSharesPath) -ForegroundColor DarkGray
@@ -335,7 +357,7 @@ $displayHostResult = {
     }
 }
 
-$hostResults = @(Invoke-ParallelShareAudit -ComputerName $computerNames -ThrottleLimit $ThrottleLimit -PingTimeoutSeconds $PingTimeoutSeconds -ShareProbeTimeoutSeconds $ShareProbeTimeoutSeconds -OnHostComplete $displayHostResult)
+$hostResults = @(Invoke-ParallelShareAudit -ComputerName $computerNames -ThrottleLimit $ThrottleLimit -PingTimeoutSeconds $PingTimeoutSeconds -ShareProbeTimeoutSeconds $ShareProbeTimeoutSeconds -IncludeHiddenShares ([bool]$IncludeHiddenShares) -UsePerShareTimeout ([bool]$UsePerShareTimeout) -OnHostComplete $displayHostResult)
 $scanResults = @($hostResults | ForEach-Object { $_.Results } | Where-Object { $null -ne $_ })
 $reportableScanResults = @($scanResults | Where-Object { -not $_.IsHidden -or $_.CanRead })
 
