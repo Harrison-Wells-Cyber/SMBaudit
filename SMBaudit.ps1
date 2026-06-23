@@ -159,9 +159,9 @@ foreach ($computer in $computerNames) {
             [void]$accessiblePaths.Add($path)
             if (-not $printedHostHeader) {
                 Write-Host ''
-                Write-Host ('┌──────────────────────────────────────────────┐') -ForegroundColor DarkCyan
-                Write-Host ("│ HOST: {0,-37}│" -f $computer) -ForegroundColor Cyan
-                Write-Host ('└──────────────────────────────────────────────┘') -ForegroundColor DarkCyan
+                Write-Host ('+----------------------------------------------+') -ForegroundColor DarkCyan
+                Write-Host ("| HOST: {0,-37}|" -f $computer) -ForegroundColor Cyan
+                Write-Host ('+----------------------------------------------+') -ForegroundColor DarkCyan
                 $printedHostHeader = $true
             }
             Write-Host ("  [FOUND] {0}" -f $path) -ForegroundColor Yellow
