@@ -245,7 +245,8 @@ function Invoke-ParallelShareAudit {
         [string[]]$ComputerName,
         [int]$ThrottleLimit = 64,
         [int]$PingTimeoutSeconds = 1,
-        [int]$ShareProbeTimeoutSeconds = 3
+        [int]$ShareProbeTimeoutSeconds = 3,
+        [scriptblock]$OnHostComplete
     )
 
     $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
@@ -253,6 +254,7 @@ function Invoke-ParallelShareAudit {
     $pool.Open()
 
     $jobs = New-Object 'System.Collections.Generic.List[psobject]'
+    $completedResults = New-Object 'System.Collections.Generic.List[psobject]'
     try {
         foreach ($computer in $ComputerName) {
             $ps = [System.Management.Automation.PowerShell]::Create()
@@ -265,16 +267,39 @@ function Invoke-ParallelShareAudit {
             })
         }
 
-        foreach ($job in $jobs) {
-            try {
-                $job.Pipeline.EndInvoke($job.Handle)
+        while ($jobs.Count -gt 0) {
+            for ($index = $jobs.Count - 1; $index -ge 0; $index--) {
+                $job = $jobs[$index]
+                if (-not $job.Handle.IsCompleted) {
+                    continue
+                }
+
+                try {
+                    $result = $job.Pipeline.EndInvoke($job.Handle)
+                    foreach ($hostResult in $result) {
+                        [void]$completedResults.Add($hostResult)
+                        if ($OnHostComplete) {
+                            & $OnHostComplete $hostResult
+                        }
+                    }
+                }
+                finally {
+                    $job.Pipeline.Dispose()
+                    $jobs.RemoveAt($index)
+                }
             }
-            finally {
-                $job.Pipeline.Dispose()
+
+            if ($jobs.Count -gt 0) {
+                Start-Sleep -Milliseconds 100
             }
         }
+
+        return $completedResults
     }
     finally {
+        foreach ($job in $jobs) {
+            $job.Pipeline.Dispose()
+        }
         $pool.Close()
         $pool.Dispose()
     }
@@ -297,13 +322,17 @@ if ($MaxHosts -and $MaxHosts -gt 0) {
 
 Write-Host ("Discovered {0} enabled computer account(s)." -f $computerNames.Count) -ForegroundColor Cyan
 
-$hostResults = @(Invoke-ParallelShareAudit -ComputerName $computerNames -ThrottleLimit $ThrottleLimit -PingTimeoutSeconds $PingTimeoutSeconds -ShareProbeTimeoutSeconds $ShareProbeTimeoutSeconds)
-$scanResults = @($hostResults | ForEach-Object { $_.Results } | Where-Object { $null -ne $_ })
+$displayHostResult = {
+    param($HostResult)
 
-foreach ($item in ($scanResults | Sort-Object Computer, Share)) {
-    $color = if ($item.CanRead) { [ConsoleColor]::Green } else { [ConsoleColor]::DarkGray }
-    Write-Host ("{0,-45} {1,-13} {2}" -f $item.Path, $item.Rights, $item.Error) -ForegroundColor $color
+    foreach ($item in ($HostResult.Results | Sort-Object Computer, Share)) {
+        $color = if ($item.CanRead) { [ConsoleColor]::Green } else { [ConsoleColor]::DarkGray }
+        Write-Host ("{0,-45} {1,-13} {2}" -f $item.Path, $item.Rights, $item.Error) -ForegroundColor $color
+    }
 }
+
+$hostResults = @(Invoke-ParallelShareAudit -ComputerName $computerNames -ThrottleLimit $ThrottleLimit -PingTimeoutSeconds $PingTimeoutSeconds -ShareProbeTimeoutSeconds $ShareProbeTimeoutSeconds -OnHostComplete $displayHostResult)
+$scanResults = @($hostResults | ForEach-Object { $_.Results } | Where-Object { $null -ne $_ })
 
 $readable = @($scanResults | Where-Object { $_.CanRead } | Sort-Object Computer, Share)
 
