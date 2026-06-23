@@ -135,13 +135,16 @@ $workerScript = {
             return @()
         }
 
-        $shares = New-Object 'System.Collections.Generic.List[string]'
+        $shares = New-Object 'System.Collections.Generic.List[psobject]'
         foreach ($line in $cmdOutput) {
             # Matches: SHARENAME   Disk   optional-comment
             if ($line -match '^\s*([^\s]+)\s+Disk\s+.*$') {
                 $shareName = $Matches[1].Trim()
                 if ($shareName -and $shareName -notin @('ADMIN$', 'IPC$', 'print$')) {
-                    [void]$shares.Add($shareName)
+                    [void]$shares.Add([pscustomobject]@{
+                        Name     = $shareName
+                        IsHidden = $shareName.EndsWith('$')
+                    })
                 }
             }
         }
@@ -204,7 +207,7 @@ $workerScript = {
 
     $shareResults = New-Object 'System.Collections.Generic.List[psobject]'
     foreach ($share in (Get-DiskSharesFromNetView -ComputerName $ComputerName)) {
-        $path = "\\$ComputerName\$share"
+        $path = "\\$ComputerName\$($share.Name)"
         $job = Start-Job -ScriptBlock ${function:Test-ShareRights} -ArgumentList $path
         $completed = Wait-Job -Job $job -Timeout $ShareProbeTimeoutSeconds
 
@@ -223,8 +226,9 @@ $workerScript = {
 
         [void]$shareResults.Add([pscustomobject]@{
             Computer = $ComputerName
-            Share    = $share
+            Share    = $share.Name
             Path     = $path
+            IsHidden = [bool]$share.IsHidden
             CanRead  = [bool]$probe.CanRead
             Rights   = [string]$probe.Rights
             Error    = [string]$probe.Error
@@ -325,7 +329,7 @@ Write-Host ("Discovered {0} enabled computer account(s)." -f $computerNames.Coun
 $displayHostResult = {
     param($HostResult)
 
-    foreach ($item in ($HostResult.Results | Sort-Object Computer, Share)) {
+    foreach ($item in ($HostResult.Results | Where-Object { -not $_.IsHidden -or $_.CanRead } | Sort-Object Computer, Share)) {
         $color = if ($item.CanRead) { [ConsoleColor]::Green } else { [ConsoleColor]::DarkGray }
         Write-Host ("{0,-45} {1,-13} {2}" -f $item.Path, $item.Rights, $item.Error) -ForegroundColor $color
     }
@@ -333,6 +337,7 @@ $displayHostResult = {
 
 $hostResults = @(Invoke-ParallelShareAudit -ComputerName $computerNames -ThrottleLimit $ThrottleLimit -PingTimeoutSeconds $PingTimeoutSeconds -ShareProbeTimeoutSeconds $ShareProbeTimeoutSeconds -OnHostComplete $displayHostResult)
 $scanResults = @($hostResults | ForEach-Object { $_.Results } | Where-Object { $null -ne $_ })
+$reportableScanResults = @($scanResults | Where-Object { -not $_.IsHidden -or $_.CanRead })
 
 $readable = @($scanResults | Where-Object { $_.CanRead } | Sort-Object Computer, Share)
 
@@ -349,11 +354,11 @@ $fullReport = New-Object 'System.Collections.Generic.List[string]'
 [void]$fullReport.Add(('Current user: {0}\{1}' -f $env:USERDOMAIN, $env:USERNAME))
 [void]$fullReport.Add(('Hosts evaluated: {0}' -f $computerNames.Count))
 [void]$fullReport.Add(('Online hosts: {0}' -f @($hostResults | Where-Object { $_.Online }).Count))
-[void]$fullReport.Add(('Shares discovered: {0}' -f $scanResults.Count))
+[void]$fullReport.Add(('Shares discovered: {0}' -f $reportableScanResults.Count))
 [void]$fullReport.Add('')
-[void]$fullReport.Add('Computer`tShare`tPath`tRights`tError')
-foreach ($item in ($scanResults | Sort-Object Computer, Share)) {
-    [void]$fullReport.Add(("{0}`t{1}`t{2}`t{3}`t{4}" -f $item.Computer, $item.Share, $item.Path, $item.Rights, $item.Error))
+[void]$fullReport.Add('Computer`tShare`tPath`tHidden`tRights`tError')
+foreach ($item in ($reportableScanResults | Sort-Object Computer, Share)) {
+    [void]$fullReport.Add(("{0}`t{1}`t{2}`t{3}`t{4}`t{5}" -f $item.Computer, $item.Share, $item.Path, $item.IsHidden, $item.Rights, $item.Error))
 }
 $fullReport | Set-Content -Path $outputPaths.FullResultsPath -Encoding UTF8
 
